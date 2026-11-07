@@ -1,0 +1,421 @@
+// ============================================================================
+// ESQUEMA DE BASE DE DATOS PRISMA - GESTOR DE ESTACIONES Y LOGÍSTICA START.GG
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------------------------------
+// ENUMS DEL SISTEMA
+// ----------------------------------------------------------------------------
+
+enum UserRole {
+  SUPER_ADMIN // Dueño de la plataforma (crea cuentas cerradas de organizadores/testers)
+  ORGANIZER   // Organizador de torneos
+  JUDGE       // Juez de piso / Staff con cuenta fija
+}
+
+enum StaffPermissionMode {
+  CHECKIN_DESK // Solo Mesa de Registro (buscar jugadores y entregar/ver PINs de 6 dígitos)
+  FLOOR_JUDGE  // Solo Juez de Piso (operar estaciones, Llamar jugador, On Hold, Skip Cooldown)
+  BOTH         // Ambos permisos habilitados simultáneamente (Mesa de Registro + Juez de Piso)
+}
+
+enum LayoutOperationalStatus {
+  DRAFT         // Plantilla física en edición (Konva.js)
+  ARMED_STANDBY // Layout activado y con juegos mapeados, esperando botón "Iniciar Torneo"
+  LIVE          // Torneo(s) en curso, motor de asignación activo
+}
+
+enum PinGenerationMode {
+  UNIFIED_PER_PLAYER // Switch Global: Un mismo jugador usa el mismo PIN de 6 dígitos en todos sus juegos
+  ISOLATED_PER_GAME  // Switch Global: Un PIN distinto de 6 dígitos por cada torneo/juego en el que participe
+}
+
+enum StationStatus {
+  IDLE      // Libre y lista para recibir partida
+  ASSIGNED  // Partida asignada, esperando que los jugadores escaneen QR e ingresen PIN
+  READY     // Todos los jugadores validaron su PIN en el QR de la estación
+  ACTIVE    // Partida en curso
+  COOLDOWN  // Periodo de enfriamiento tras finalizar partida (saltable con Skip Cooldown)
+  DISABLED  // Estación apagada / fuera de servicio
+}
+
+enum StationIconType {
+  PRESET       // Ícono vectorial predeterminado de la plataforma
+  CUSTOM_IMAGE // Imagen personalizada (.png, .jpg, .webp) sanitizada con Sharp
+}
+
+enum TeamFormat {
+  SOLO_1V1
+  DOUBLES_2V2
+  SQUAD_4V4
+}
+
+enum MatchState {
+  PENDING   // Sincronizada de Start.gg o creada. Esperando estación libre o que se definan oponentes (TBD/Bye)
+  ASSIGNED  // Asignada a una estación física compatible
+  READY     // Todos los participantes escanearon el QR e ingresaron su PIN (isReady = true)
+  ACTIVE    // En juego (Automático si requireAdminStart = false, o manual por el Admin)
+  ON_HOLD   // Pausada por el Juez/Admin (ej. jugador demorado en otro juego); libera la estación de inmediato
+  COMPLETED // Finalizada (Resultado leído automáticamente de Start.gg o cerrado en Modo Offline)
+  DQ        // Descalificación por incomparecencia aplicada por el Juez en Start.gg o en Modo Offline
+}
+
+// ----------------------------------------------------------------------------
+// MÓDULO 1: USUARIOS Y AUTENTICACIÓN CERRADA (ALLOWLIST)
+// ----------------------------------------------------------------------------
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  username     String   @unique
+  passwordHash String   // Hash bcrypt (Las cuentas las aprovisiona el SUPER_ADMIN)
+  role         UserRole @default(ORGANIZER)
+  isActive     Boolean  @default(true)
+
+  // Vinculación opcional con OAuth2 de Start.gg (para permisos de escritura hacia Start.gg)
+  // Nota: Para lectura pública no es obligatorio; el backend usa STARTGG_SYSTEM_API_TOKEN
+  startggUserId       String? @unique
+  startggAccessToken  String?
+  startggRefreshToken String?
+
+  // Módulo 9: Configuración personalizada de widgets de KPIs (mostrar/ocultar/orden)
+  dashboardKpiConfig Json?
+
+  layouts           Layout[]
+  tournaments       Tournament[]
+  createdStaffPasses StaffAccessPass[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ----------------------------------------------------------------------------
+// MÓDULO 2: LAYOUTS FÍSICOS (KONVA.JS) Y ESTACIONES
+// ----------------------------------------------------------------------------
+
+model Layout {
+  id          String  @id @default(uuid())
+  name        String
+  description String?
+
+  // Propiedades visuales del Lienzo (Canvas Konva.js) con soporte Hexadecimal (#RRGGBB)
+  canvasWidth        Int    @default(1920)
+  canvasHeight       Int    @default(1080)
+  backgroundColorHex String @default("#0F172A")
+  gridColorHex       String @default("#1E293B")
+
+  // Estado operativo del Layout
+  isActive          Boolean                 @default(false)
+  operationalStatus LayoutOperationalStatus @default(DRAFT)
+
+  // Reglas Globales del Evento activo en este Layout
+  pinGenerationMode        PinGenerationMode @default(UNIFIED_PER_PLAYER)
+  requireAdminStart        Boolean           @default(false)
+  universalCooldownSeconds Int               @default(45)
+  noShowTimeoutMinutes     Int               @default(10)
+
+  ownerId String
+  owner   User   @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  stations    Station[]
+  tournaments Tournament[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Station {
+  id            String @id @default(uuid()) // Este UUID genera la URL exclusiva del QR: /station/[id]
+  layoutId      String
+  layout        Layout @relation(fields: [layoutId], references: [id], onDelete: Cascade)
+
+  stationNumber Int    // Número visible de la estación (ej. Estación #1, #2...)
+  name          String // Nombre personalizado (ej. "Consola 1", "Escenario Stream")
+
+  // Prioridad de asignación (Orden consecutivo en barra lateral + etiqueta de prioridad absoluta)
+  priorityIndex Int     @default(0)
+  isPriority    Boolean @default(false)
+
+  // Coordenadas espaciales y estilo dentro del Canvas de Konva.js
+  posX           Float  @default(100)
+  posY           Float  @default(100)
+  width          Float  @default(120)
+  height         Float  @default(120)
+  rotation       Float  @default(0)
+  fillColorHex   String @default("#3B82F6")
+  strokeColorHex String @default("#1D4ED8")
+
+  // Personalización de ícono o imagen sanitizada
+  iconType       StationIconType @default(PRESET)
+  presetIconName String          @default("console")
+  customImageUrl String?         // Ruta de imagen procesada por Sharp (.webp/.png limpia de metadatos)
+
+  // Etiquetas operativas dinámicas (ej. ["Stream", "Sin DLCs", "Escenario"])
+  metaTags String[] @default([])
+
+  // Estado en tiempo real durante el torneo
+  status              StationStatus @default(IDLE)
+  progressiveShutdown Boolean       @default(false) // Si es true, se apaga (DISABLED) al terminar la partida actual
+  cooldownEndsAt      DateTime?     // Permite aplicar o saltar el Cooldown Universal ("Skip Cooldown")
+
+  // Juegos compatibles asignados a esta estación al activar el Layout
+  supportedGames StationVideogame[]
+  matches        Match[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([layoutId, priorityIndex])
+}
+
+// ----------------------------------------------------------------------------
+// VIDEOJUEGOS Y MAPEO MULTI-JUEGO POR ESTACIÓN
+// ----------------------------------------------------------------------------
+
+model Videogame {
+  id                 String  @id @default(uuid())
+  startggVideogameId Int?    @unique // ID oficial del videojuego en Start.gg
+  name               String  // Ej. "Street Fighter 6", "Super Smash Bros. Ultimate", "Tekken 8"
+  slug               String?
+  iconUrl            String?
+
+  stations         StationVideogame[]
+  tournamentEvents TournamentEvent[]
+
+  createdAt DateTime @default(now())
+}
+
+model StationVideogame {
+  id          String    @id @default(uuid())
+  stationId   String
+  videogameId String
+
+  station     Station   @relation(fields: [stationId], references: [id], onDelete: Cascade)
+  videogame   Videogame @relation(fields: [videogameId], references: [id], onDelete: Cascade)
+
+  @@unique([stationId, videogameId])
+}
+
+// ----------------------------------------------------------------------------
+// TORNEOS Y EVENTOS (SOPORTE START.GG POR URL/ID Y MODO INDEPENDIENTE OFFLINE)
+// ----------------------------------------------------------------------------
+
+model Tournament {
+  id                  String  @id @default(uuid())
+  name                String  // Editable desde la barra lateral o sincronizado de Start.gg
+  startggSlug         String? @unique // Ej. "tournament/tijuana-fight-fest-2026"
+  startggTournamentId String? @unique
+  isOffline           Boolean @default(false) // True cuando se usa el Modo Independiente sin Start.gg
+
+  // Vinculación con el Layout físico activo
+  layoutId String?
+  layout   Layout? @relation(fields: [layoutId], references: [id], onDelete: SetNull)
+
+  // Configuración opcional de notificaciones para el Bot de Discord (Módulo 8)
+  discordGuildId   String?
+  discordChannelId String?
+
+  ownerId String
+  owner   User   @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  events      TournamentEvent[]
+  staffPasses StaffAccessPass[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ----------------------------------------------------------------------------
+// MÓDULO 1.5: ACCESOS TEMPORALES DE STAFF / JUECES (TORNEOS GRANDES 120+ JUGADORES)
+// ----------------------------------------------------------------------------
+
+model StaffAccessPass {
+  id           String     @id @default(uuid())
+  tournamentId String
+  tournament   Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+
+  createdByUserId String
+  createdBy       User   @relation(fields: [createdByUserId], references: [id], onDelete: Cascade)
+
+  // Nombre identificativo del ayudante (ej. "Juan - Juez Pasillo 1", "María - Mesa Registro")
+  label String
+
+  // Credencial Persistente: Permite conservar y volver a copiar la URL (/staff-access/[accessToken])
+  // o mostrar de nuevo el QR en cualquier momento si el ayudante lo pierde o cierra su navegador.
+  accessToken String  @unique @default(uuid())
+  accessPin   String? @db.VarChar(6) // PIN opcional en texto plano visible por el Admin para reenviarlo
+
+  // Permisos Dinámicos en Caliente: El Admin puede cambiarlo entre CHECKIN_DESK, FLOOR_JUDGE o BOTH
+  permissionMode StaffPermissionMode @default(BOTH)
+
+  // Control de Baja / Deshabilitación: El Admin puede pausarlo o darlo de baja (false) cuando quiera
+  isActive  Boolean   @default(true)
+  revokedAt DateTime?
+
+  // Filtro opcional de Eventos/Juegos asignados a este juez (vacío = todos los juegos del torneo)
+  assignedEventIds String[] @default([])
+
+  lastUsedAt DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  @@index([tournamentId, isActive])
+  @@index([accessToken])
+}
+
+model TournamentEvent {
+  id             String     @id @default(uuid())
+  tournamentId   String
+  tournament     Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+
+  videogameId    String
+  videogame      Videogame  @relation(fields: [videogameId], references: [id])
+
+  name           String     // Ej. "Ultimate Singles", "SF6 Dobles"
+  startggEventId String?    @unique
+  startggSlug    String?    @unique
+  teamFormat     TeamFormat @default(SOLO_1V1)
+
+  // Doble Candado de Inicio:
+  // 1. isStarted: El Admin presionó "Iniciar Torneo" en nuestra plataforma
+  // 2. startggState: Estado leído de Start.gg ("CREATED", "ACTIVE", "COMPLETED")
+  isStarted    Boolean @default(false)
+  startggState String  @default("CREATED")
+
+  participants EventParticipant[]
+  matches      Match[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ----------------------------------------------------------------------------
+// MÓDULO 3: PARTICIPANTES E IDENTIDAD MULTI-JUEGO + PINs EN TEXTO PLANO
+// ----------------------------------------------------------------------------
+
+model Player {
+  id            String  @id @default(uuid())
+  startggUserId String? @unique // Permite detectar si la misma persona juega en 2 o más juegos a la vez
+  gamerTag      String
+  prefix        String? // Sponsor / Clan tag (ej. "T1 | ")
+
+  // Cero datos personales sensibles (sin correos ni contraseñas para jugadores)
+  eventParticipations EventParticipant[]
+  matchParticipations MatchParticipant[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([gamerTag])
+}
+
+model EventParticipant {
+  id        String          @id @default(uuid())
+  eventId   String
+  event     TournamentEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  playerId  String
+  player    Player          @relation(fields: [playerId], references: [id], onDelete: Cascade)
+
+  startggEntrantId     String?
+  startggParticipantId String?
+
+  // REGLA OPERATIVA ESTRICTA: PIN de 6 dígitos en TEXTO PLANO (VARCHAR(6))
+  // Permite que el juez se lo dicte al jugador al instante si lo olvida.
+  pinCode String? @db.VarChar(6)
+
+  isCheckedInVenue Boolean @default(false)
+  isEliminated     Boolean @default(false)
+  finalPlacement   Int?    // Para KPIs de Top 8 / Top 3
+
+  matchParticipations MatchParticipant[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([eventId, playerId])
+  @@index([eventId, pinCode])
+}
+
+// ----------------------------------------------------------------------------
+// MÓDULO 4 Y 5: PARTIDAS (MATCHES), MÁQUINA DE ESTADOS Y TABLA PIVOTE (1v1/2v2/4v4)
+// ----------------------------------------------------------------------------
+
+model Match {
+  id           String          @id @default(uuid())
+  eventId      String
+  event        TournamentEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  stationId    String?
+  station      Station?        @relation(fields: [stationId], references: [id], onDelete: SetNull)
+
+  startggSetId String?         @unique
+  roundText    String          @default("Round 1") // Ej. "Winners Quarter-Final", "Losers Round 2"
+  roundNumber  Int             @default(1)
+  bestOf       Int             @default(3)         // Ej. Bo3 (al primero que gane 2) o Bo5 (al primero que gane 3)
+
+  // Máquina de Estados Estricta
+  state               MatchState @default(PENDING)
+  isComponentsDefined Boolean    @default(false) // False si hay "Bye" o "TBD". Solo True puede pasar a ASSIGNED
+  startggSetState     Int?       // En Start.gg: 1 = Ready/Llamable, 2 = In Progress, 3 = Completed
+
+  // Prioridad en Cola: Normal = 0. Cuando regresa de ON_HOLD sube a la cima absoluta (ej. 1000)
+  queuePriority Int @default(0)
+
+  // Bandera de idempotencia para el Bot de Discord (evita spam/anuncios duplicados)
+  discordNotified Boolean @default(false)
+
+  // Marcadores y Ganador (Leídos de Start.gg cuando el juez reporta, o capturados en Modo Offline)
+  winnerTeamSlot Int? // 1 o 2
+  team1Score     Int?
+  team2Score     Int?
+
+  // Timestamps para Temporizador No-Show (10 min) y KPIs (Tiempo promedio de partida)
+  assignedAt      DateTime?
+  readyAt         DateTime?
+  startedAt       DateTime?
+  onHoldAt        DateTime?
+  completedAt     DateTime?
+  durationSeconds Int?
+
+  participants MatchParticipant[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([eventId, state, queuePriority])
+  @@index([stationId, state])
+}
+
+model MatchParticipant {
+  id                 String           @id @default(uuid())
+  matchId            String
+  match              Match            @relation(fields: [matchId], references: [id], onDelete: Cascade)
+
+  eventParticipantId String
+  eventParticipant   EventParticipant @relation(fields: [eventParticipantId], references: [id], onDelete: Cascade)
+
+  playerId           String
+  player             Player           @relation(fields: [playerId], references: [id], onDelete: Cascade)
+
+  // Soporta 1v1 (1 jugador en slot 1, 1 en slot 2), 2v2 (2 en slot 1, 2 en slot 2) y 4v4
+  teamSlot Int // 1 = Equipo/Lado A, 2 = Equipo/Lado B
+
+  // Check-in físico en la consola vía QR + PIN de 6 dígitos
+  isReady     Boolean   @default(false)
+  checkedInAt DateTime?
+
+  // Si este participante o su equipo recibió DQ por incomparecencia
+  isDq Boolean @default(false)
+
+  @@unique([matchId, eventParticipantId])
+  @@index([playerId])
+}
