@@ -45,3 +45,11 @@ Thumbs.db
 # Testing & TypeScript cache
 coverage/
 *.tsbuildinfo
+
+# Documentación interna de desarrollo y contexto IA (Privado)
+ARCHITECTURE.md
+INDEX.md
+PROJECT_STATUS.md
+GEMINI.md
+docs/
+
